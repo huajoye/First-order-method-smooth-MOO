@@ -409,8 +409,28 @@ def algorithm2_progressive(
         except Exception:
             return -1
 
-    # Checkpoint 0:  bundle has one point (the initial iterate).
-    _checkpoint(f"outer 0/{max_outer}")
+    # Checkpoint 0:  report the worst-case error of the constant map x̂(λ) ≡ x_0.
+    # This matches the baseline's checkpoint 0 (which also reports the constant
+    # map at x_0) so both algorithms agree on the "initial" worst-case error
+    # before any algorithmic work has been done.  The K gradient evaluations
+    # spent on bundle.add_point(x_0, ...) at the top of this routine will be
+    # accounted for at checkpoint 1 alongside the work of the first outer
+    # iteration, keeping the cumulative grad_evals count correct from then on.
+    fine_grid = reference_map["fine_grid"]
+    F_star = reference_map["F_star"]
+    err0 = -np.inf
+    for i, lam in enumerate(fine_grid):
+        F_lam_x0 = sum(lam[k] * objectives[k](x0) for k in range(K))
+        err = F_lam_x0 - F_star[i]
+        if err > err0:
+            err0 = float(err)
+    cpu_times.append(time.time() - t_start)
+    worst_errs.append(err0)
+    outer_iters_history.append(0)
+    grad_evals_history.append(0)
+    if verbose:
+        print(f"  A2 outer 0/{max_outer} | t={cpu_times[-1]:.2f}s | grad_evals=0 "
+              f"| err={err0:.4e}  (constant map)")
 
 
     for t in range(max_outer):

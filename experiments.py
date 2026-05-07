@@ -137,23 +137,29 @@ def _plot_grads_vs_accuracy(
     """
     fig, ax = plt.subplots(figsize=(8, 5.5))
 
-    ax.loglog(
+    ax.plot(
         a2["grad_evals_history"], a2["worst_errs"],
         "o-", color="#2563eb", markersize=5, linewidth=1.8,
         label=f"Algorithm 2 ({pc_label})",
     )
-    ax.loglog(
+    ax.plot(
         bl["grad_evals_history"], bl["worst_errs"],
         "s-", color="#dc2626", markersize=5, linewidth=1.8,
         label=f"Uniform discretisation (r = {coarse_resolution})",
     )
 
-    ax.set_xlabel("Gradient evaluations  $\\sum_k \\sum_t |\\nabla F_k(\\cdot)|$")
+    # Use a symlog x-axis so the shared initial point at grad_evals = 0
+    # is plotted (a true log axis cannot represent zero).  Linear region
+    # extends out to linthresh = 1, logarithmic beyond.
+    ax.set_xscale("symlog", linthresh=1.0)
+    ax.set_yscale("log")
+
+    ax.set_xlabel("Number of total gradient evaluations")
     ax.set_ylabel(r"$\sup_{\lambda \in G_{\mathrm{fine}}}\,"
                   r"[F_\lambda(\hat x(\lambda)) - F_\lambda^*]$")
     params_str = _format_params(problem_params)
     ax.set_title(
-        f"Gradient evaluations vs worst-case suboptimality\n"
+        f"Worst-case suboptimality vs Total gradient evaluations \n"
         f"{params_str}  |  G_fine res = {fine_resolution}"
     )
     ax.legend()
@@ -222,10 +228,10 @@ def experiment_logreg_gap(
     verbose: bool = True,
     coarse_resolution: int = 10,
     fine_resolution: int = 20,
-    n_passes: int = 25,
-    steps_per_point_per_pass: int = 3,
-    max_outer: int = 100,
-    max_inner: int = 20,
+    n_passes: int = 3,
+    steps_per_point_per_pass: int = 10,
+    max_outer: int = 300,
+    max_inner: int = 5,
     eval_every_n_grads: int = 1,
     plot_path_cpu: str = "logreg_cpu_vs_accuracy.png",
     plot_path_grads: str = "logreg_grads_vs_accuracy.png",
@@ -257,7 +263,7 @@ def experiment_logreg_gap(
           "vs worst-case err")
     print("=" * 65)
 
-    K, p, n, reg = 3, 5, 30, 0.1
+    K, p, n, reg = 3, 3, 30, 0.1
     d = K * p
     objs, grads, L, mu = make_logreg_strongly_convex(
         K=K, p=p, n=n, reg=reg, seed=43,
@@ -799,5 +805,5 @@ if __name__ == "__main__":
     print("✓ Experiment 1 completed.")
     #res2 = experiment_logreg_separable_gaussian()
     #print("✓ Experiment 2 (separable Gaussian mixture, UB) completed.")
-    res3 = experiment_mlp_gn()
-    print("✓ Experiment 3 completed.")
+    #res3 = experiment_mlp_gn()
+    #print("✓ Experiment 3 completed.")
