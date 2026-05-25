@@ -23,7 +23,7 @@ The paper's contribution is an adaptive bundle method that builds one shared fir
 | `objectives.py` | Two objective factories: `make_logreg_strongly_convex` (multi-class logistic regression with $\ell_2$ regularisation, $\mu = \text{reg}$) and `make_mlp_nonconvex` (1-hidden-layer MLP with softmax cross-entropy). Both expose per-class loss and gradient closures plus a fused joint oracle. |
 | `experiments.py` | Two end-to-end experiments (`experiment_logreg_gap`, `experiment_mlp_gn`) that build the data, run both algorithms with matching checkpoint accounting, and produce CPU-time-vs-accuracy and grad-evals-vs-accuracy plots. |
 
-The paper PDF that this code follows is included as `A_first_order_bundle_method_for_smooth_multi_objective_optimization_11.pdf`.
+The paper PDF that this code follows is included as `A First-Order Bundle Method for Smooth Multi-objective Optimization.pdf`.
 
 ---
 
