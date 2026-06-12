@@ -9,7 +9,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 from scipy.optimize import minimize as sp_minimize
 
 from bundle import Bundle, UB, GAP, GN, LB, T_map
-from chebyshev import chebyshev_direction
 
 
 # =====================================================================
@@ -448,15 +447,7 @@ def _maximise_GN(bundle: Bundle,prev_lam: Optional[np.ndarray] = None) -> Tuple[
     ---------
     From Eq. (17):
 
-        GN(λ; Bm) = (1/2)(1/µλ − 1/Lλ) · min_i ‖J_F(x_i)^T λ‖²
-
-    where µλ = λ^T µ, Lλ = λ^T L.  The scale factor (1/(2µλ) − 1/(2Lλ))
-    is convex in λ (sum of convex reciprocals of linear functions), and
-    min_i ‖J^T λ‖² is concave.  Their product is neither convex nor
-    concave.
-
-    When mu is not available (generic non-convex), GN falls back to
-    min_i ‖J_F(x_i)^T λ‖² which *is* concave.
+        GN(λ; Bm) = min_i ‖J_F(x_i)^T λ‖²
 
     We use multi-start SLSQP as for GAP, but with three CPU optimisations:
 
@@ -549,71 +540,6 @@ def _maximise_GN(bundle: Bundle,prev_lam: Optional[np.ndarray] = None) -> Tuple[
 
 
 # =====================================================================
-#  Outer-loop stopping: worst-case-error plateau (patience) detector
-# =====================================================================
-class _OuterPlateauTracker:
-    """Patience-on-improvement early-stop on the worst-case suboptimality.
-
-    Monitors the checkpointed worst-case suboptimality
-
-        err_t = sup_{λ ∈ G_fine} [ F_λ(x̂(λ)) − F*_λ ]
-
-    — the quantity plotted on the y-axis — and signals that the *outer*
-    loop should terminate once that error has failed to improve by more
-    than ``tol`` for ``patience`` consecutive checkpoints.
-
-    This is the practical replacement for the theoretical 2ε/3 outer
-    threshold and for relying solely on ``target_err``: rather than
-    insisting the algorithm reach a fixed (possibly unreachable) error
-    level, we stop when additional outer iterations stop reducing the
-    plotted worst-case error.  It is evaluated only at checkpoints, where
-    the worst-case error is already computed, so it adds no extra cost.
-
-    "Improvement" means the new error beats the best-so-far by more than
-    ``tol`` — relative (``rel=True``, the default) or absolute
-    (``rel=False``):
-
-        rel=True :   err < best * (1 - tol)
-        rel=False:   err < best - tol
-
-    The relative test is the default because the worst-case error spans
-    many orders of magnitude over a run.  ``patience`` counts *checkpoints*
-    (not raw outer iterations); with the usual ``checkpoint_every`` /
-    ``eval_every_n_grads`` cadence the two are proportional.
-    """
-
-    __slots__ = ("patience", "tol", "rel", "best", "stale", "n_seen")
-
-    def __init__(self, patience: int = 5, tol: float = 1e-3, rel: bool = True):
-        self.patience = int(patience)
-        self.tol = float(tol)
-        self.rel = bool(rel)
-        self.best = np.inf
-        self.stale = 0          # consecutive non-improving checkpoints
-        self.n_seen = 0
-
-    def update(self, err: float) -> bool:
-        """Record a new checkpoint error; return True if the loop should stop.
-
-        The plateau can only trigger after at least ``patience`` checkpoints
-        have been observed, so the initial high-error checkpoints will not
-        cause a premature stop.
-        """
-        self.n_seen += 1
-        if self.rel:
-            improved = err < self.best * (1.0 - self.tol)
-        else:
-            improved = err < self.best - self.tol
-        if improved or not np.isfinite(self.best):
-            self.best = min(self.best, err)
-            self.stale = 0
-        else:
-            self.best = min(self.best, err)
-            self.stale += 1
-        return self.n_seen >= self.patience and self.stale >= self.patience
-
-
-# =====================================================================
 #  Adaptive inner loop (BundleUpdate with max_steps)
 # =====================================================================
 def _bundle_update_adaptive(
@@ -640,9 +566,11 @@ def _bundle_update_adaptive(
       proof (Appendix B.1) requires the bundle update to drive
       ``PC(λ_t; B_{t+1}) ≤ ε/3`` at the active λ_t before the outer
       loop advances.  In this mode we add T_map iterates one at a time
-      and recompute the active-λ PC after each addition; the inner loop
-      terminates as soon as PC drops below ``eps_inner`` or after
-      ``max_steps`` candidates (safety cap).
+      and recompute ``pc_fn(bundle, lam)`` after each addition; the
+      inner loop terminates as soon as the PC at λ drops below
+      ``eps_inner``, or after ``max_steps`` candidates (safety cap, to
+      avoid an unbounded run if a corner case violates the theory's
+      smoothness/strong-convexity assumptions).
 
     Pruning heuristic
     -----------------
@@ -667,7 +595,8 @@ def _bundle_update_adaptive(
     Returns
     -------
     Number of T_map iterations actually executed.  Equals ``max_steps``
-    when no stopping rule fires within the safety cap; smaller otherwise.
+    when ``eps_inner=None`` or when the ε-target was not reached within
+    the safety cap; smaller otherwise.
     """
     base_m = bundle.m
     steps_taken = 0
@@ -775,146 +704,6 @@ def _bundle_update_adaptive(
 
 
 # =====================================================================
-#  Algorithm 4 inner loop (Chebyshev-center direction + Adam)
-# =====================================================================
-def _chebyshev_update_adaptive(
-    bundle: Bundle,
-    lam: np.ndarray,
-    pc_fn: Callable,
-    objectives: List[Callable],
-    grad_objectives: List[Callable],
-    max_steps: int,
-    delta: Optional[float] = None,
-    prune: bool = True,
-    joint_oracle: Optional[Callable] = None,
-    adam_lr: float = 1e-2,
-    adam_b1: float = 0.9,
-    adam_b2: float = 0.999,
-    adam_eps: float = 1e-8,
-) -> int:
-    """Inner loop at fixed λ using Algorithm 4 (DualChebyshev-Exact-Adam).
-
-    Drop-in replacement for ``_bundle_update_adaptive`` that generates the
-    inner-iterate chain with the Chebyshev-center direction rule of Yoon
-    et al. (2026) wrapped in an Adam update, instead of T_map steps.  The
-    OUTER loop (PC-maximisation over λ, checkpointing, worst-case-error
-    metric) is identical; only the inner-iterate generator changes.
-
-    Fixed-λ multi-objective sub-problem
-    -----------------------------------
-    At the outer-chosen weighting ``lam`` we solve the parametric problem
-        min_θ  F_λ(θ) = Σ_k λ_k F_k(θ).
-    Algorithm 4 is a multi-objective direction selector, so we feed it the
-    K λ-weighted objective gradients
-        g_k = λ_k ∇F_k(θ)      (k = 1, …, K),
-    and it returns a direction that descends all of them simultaneously.
-    The Adam moments are local to this inner call (re-initialised to zero
-    each outer iteration, matching "Initialize Adam moments" in
-    Algorithm 4 line 1).
-
-    Stopping criterion (THE PAPER'S EXACT RULE)
-    -------------------------------------------
-    Terminates when the dual-weighted normalized-gradient norm satisfies
-        ‖w_t‖₂ = ‖Σ_i α_i ĝ_i‖₂ ≤ δ,
-    where ĝ_i = g_i/‖g_i‖₂ are the ℓ2-normalized λ-weighted objective
-    gradients and α is the Chebyshev dual solution (Algorithm 1/4 of Yoon
-    et al.).  ‖w_t‖ is the paper's ε-Pareto-stationarity surrogate (small
-    ‖w_t‖ ⇔ the normalized gradients nearly cancel ⇔ no common descent
-    direction remains).  This is exactly the quantity ``chebyshev_direction``
-    returns as ``w_norm``, so the check is free — no separate PC evaluation.
-
-    This replaces the earlier bundle-style PC ≤ ε/3 inner stop.  Note the
-    criterion is checked on the *current* iterate's gradients (before the
-    Adam step that would move away from it): if θ_t is already
-    δ-Pareto-stationary for F_λ, we stop without taking a further step.
-    ``δ=None`` disables the check (run the full ``max_steps`` budget).
-
-    As before, every accepted iterate is appended to the bundle so the
-    outer PC-max and the T_map-based worst-case-error metric see the new
-    points.
-
-    Bundle / pruning / accounting all mirror ``_bundle_update_adaptive``:
-    each inner iterate costs K gradient evaluations, and with ``prune``
-    only the smallest-‖∇F_λ‖ candidate is retained in the bundle (paper §7
-    heuristic of the *bundle* method — kept here for an apples-to-apples
-    bundle representation across the two inner loops).
-
-    Returns
-    -------
-    Number of Adam/direction steps actually executed.
-    """
-    base_m = bundle.m
-    K = bundle.K
-    d = bundle.d
-    L_arr = bundle.L
-    mu_arr = bundle.mu
-
-    # Starting iterate for the inner trajectory:  the current best bundle
-    # point at this λ (lowest F_λ), matching how the T_map inner loop
-    # implicitly anchors at the argmin bundle point.  Using the bundle's
-    # best point keeps the two inner loops comparable.
-    Fmat0, Jmat0 = _bundle_arrays(bundle)
-    F_lam_vals = Fmat0 @ lam                       # (m,)
-    theta = np.array(bundle.points[int(np.argmin(F_lam_vals))], dtype=np.float64)
-
-    # Local Adam moments (re-init each outer iteration, per Algorithm 4 l.1)
-    M = np.zeros(d, dtype=np.float64)
-    S = np.zeros(d, dtype=np.float64)
-
-    steps_taken = 0
-    for s in range(max_steps):
-        # --- per-objective λ-weighted gradients at the current iterate ---
-        if joint_oracle is not None:
-            _fv, gv = joint_oracle(theta)          # gv: (K, d)
-            grads_k = gv
-        else:
-            grads_k = np.stack([grad_objectives[k](theta) for k in range(K)], axis=0)
-        g_weighted = lam[:, None] * grads_k        # (K, d):  g_k = λ_k ∇F_k
-
-        # --- Chebyshev-center direction (Algorithm 4 lines 4-17) ---
-        # ``w_norm = ‖Σ_i α_i ĝ_i‖₂`` is the paper's Pareto-stationarity
-        # surrogate, evaluated at the CURRENT iterate θ_t.
-        d_dir, w_norm, _alpha = chebyshev_direction(g_weighted)
-
-        # --- paper's exact stopping rule:  ‖w_t‖ ≤ δ (Algorithm 1/4) ---
-        # Checked on the current iterate's gradients, before the Adam step.
-        # If θ_t is already δ-Pareto-stationary for F_λ, stop without moving.
-        if delta is not None and w_norm <= delta:
-            break
-
-        # --- Adam update (Algorithm 4 lines 18-22) ---
-        t1 = s + 1
-        M = adam_b1 * M + (1.0 - adam_b1) * d_dir
-        S = adam_b2 * S + (1.0 - adam_b2) * (d_dir * d_dir)
-        M_hat = M / (1.0 - adam_b1 ** t1)
-        S_hat = S / (1.0 - adam_b2 ** t1)
-        theta = theta - adam_lr * M_hat / (np.sqrt(S_hat) + adam_eps)
-
-        # --- commit the new iterate to the bundle ---
-        bundle.add_point(theta.copy(), objectives, grad_objectives,
-                         joint_oracle=joint_oracle)
-        steps_taken += 1
-
-    # --- optional pruning to the argmin-‖∇F_λ‖ winner (mirror bundle loop) ---
-    if prune and steps_taken > 1:
-        cand_Js = np.asarray(bundle.grads[base_m:base_m + steps_taken])  # (S, K, d)
-        cand_grads_lam = np.einsum('skd,k->sd', cand_Js, lam)            # (S, d)
-        cand_gnorms = np.einsum('sd,sd->s', cand_grads_lam, cand_grads_lam)
-        best_local = int(np.argmin(cand_gnorms))
-        best_idx = base_m + best_local
-        win_x = bundle.points[best_idx]
-        win_fv = bundle.fvals[best_idx]
-        win_gv = bundle.grads[best_idx]
-        for _ in range(steps_taken):
-            bundle.pop_point()
-        bundle.points.append(win_x)
-        bundle.fvals.append(win_fv)
-        bundle.grads.append(win_gv)
-
-    return steps_taken
-
-
-# =====================================================================
 #  Instrumented Algorithm 2:  checkpoint after each outer iteration
 # =====================================================================
 def algorithm2_progressive(
@@ -931,21 +720,11 @@ def algorithm2_progressive(
     max_outer: int = 50,
     max_inner: int = 400,
     prune_inner: bool = True,
-    checkpoint_every: int = 1,
+    checkpoint_every: int = 20,
     eval_every_n_grads: Optional[int] = None,
     target_err: Optional[float] = None,
     joint_oracle: Optional[Callable] = None,
     use_fused_oracle: bool = True,
-    inner_loop: str = "bundle",
-    adam_lr: float = 1e-2,
-    adam_b1: float = 0.9,
-    adam_b2: float = 0.999,
-    adam_eps: float = 1e-8,
-    delta: Optional[float] = 1e-2,
-    outer_plateau: bool = True,
-    outer_patience: int = 20,
-    outer_tol: float = 1e-3,
-    outer_rel: bool = True,
     verbose: bool = False,
 ) -> Dict:
     """Run Algorithm 2 with periodic worst-case-error checkpoints.
@@ -1025,7 +804,7 @@ def algorithm2_progressive(
                            ``make_mlp_nonconvex`` / ``make_logreg_*``.
     """
     if epsilon is not None:
-        eps_inner = epsilon / 3          # inner-loop PC threshold (ε/3)
+        eps_inner = epsilon / 3          # inner-loop PC threshold
     else:
         eps_inner = None
 
@@ -1175,48 +954,17 @@ def algorithm2_progressive(
         print(f"  A2 outer 0/{max_outer} | t=0.00s | grad_evals=0 " f"| err={err0:.4e}  (constant map)")
     t_start = time.time()
 
-    # Outer-loop worst-case-error plateau tracker.  Terminates the
-    # algorithm when the checkpointed worst-case error stops improving
-    # (see _OuterPlateauTracker).  Disabled by setting outer_plateau=False.
-    outer_tracker = (_OuterPlateauTracker(outer_patience, outer_tol, outer_rel)
-                     if outer_plateau else None)
-
     for t in range(max_outer):
         pc_star, best_lam = maximise_pc(bundle)
         pc_history.append(pc_star)
-
-        # ---- Outer-loop ε-stopping (Algorithm 2, App. B.1) ----------
-        # If PC*_t ≤ 2ε/3, the bundle B_t already certifies PC*_t ≤ ε
-        # over the full simplex via the Lipschitz-net argument.  Stop
-        # *before* spending another inner round of gradient evaluations.
-        # if eps_outer is not None and pc_star <= eps_outer:
-        #     if verbose:
-        #         print(f"  A2 converged at outer {t}/{max_outer}: "
-        #               f"PC*={pc_star:.4e} ≤ 2ε/3 = {eps_outer:.4e}")
-        #     break
-
         bundle_m_before = bundle.m
-        if inner_loop == "bundle":
-            steps = _bundle_update_adaptive(
-                bundle, best_lam, pc_fn, objectives, grad_objectives,
-                max_steps=max_inner,
-                eps_inner=eps_inner,
-                prune=prune_inner,
-                joint_oracle=joint_oracle,
-            )
-        elif inner_loop == "chebyshev":
-            steps = _chebyshev_update_adaptive(
-                bundle, best_lam, pc_fn, objectives, grad_objectives,
-                max_steps=max_inner,
-                delta=delta,
-                prune=prune_inner,
-                joint_oracle=joint_oracle,
-                adam_lr=adam_lr, adam_b1=adam_b1,
-                adam_b2=adam_b2, adam_eps=adam_eps,
-            )
-        else:
-            raise ValueError(
-                f"inner_loop must be 'bundle' or 'chebyshev', got {inner_loop!r}")
+        steps = _bundle_update_adaptive(
+            bundle, best_lam, pc_fn, objectives, grad_objectives,
+            max_steps=max_inner,
+            eps_inner=eps_inner,
+            prune=prune_inner,
+            joint_oracle=joint_oracle,
+        )
         # Each retained candidate costs K gradient evaluations.  When the
         # ε/3 inner stop fires early the bundle grew by ``steps`` points
         # before pruning; after pruning (if enabled) only one is retained,
@@ -1250,21 +998,6 @@ def algorithm2_progressive(
                     print(f"  A2 early-stop at outer {t + 1}/{max_outer}: "
                           f"err={worst_errs[-1]:.4e} ≤ target_err={target_err:.4e}")
                 break
-            # ---- Worst-case-error plateau early-stop ---------------------
-            # Terminate when the checkpointed worst-case error stops
-            # improving by more than ``outer_tol`` for ``outer_patience``
-            # consecutive checkpoints.  This is the practical replacement
-            # for the theoretical 2ε/3 outer threshold: it stops the
-            # algorithm once additional outer iterations no longer reduce
-            # the plotted worst-case suboptimality, instead of grinding to
-            # the ``max_outer`` cap.  Evaluated only at checkpoints, where
-            # ``worst_errs[-1]`` is already computed, so it is free.
-            if outer_tracker is not None and outer_tracker.update(worst_errs[-1]):
-                if verbose:
-                    print(f"  A2 plateau-stop at outer {t + 1}/{max_outer}: "
-                          f"worst-case err={worst_errs[-1]:.4e} has not improved "
-                          f"by >{outer_tol:g} for {outer_patience} checkpoints")
-                break
         elif verbose:
             print(f"  A2 outer {t + 1}/{max_outer} | grad_evals={grad_evals} "
                   f"| PC*={pc_star:.4e} | inner={steps:3d} (retained {retained_steps}) "
@@ -1278,78 +1011,3 @@ def algorithm2_progressive(
         "grad_evals_history": grad_evals_history,
         "pc_history": pc_history,
     }
-
-# =====================================================================
-#  Algorithm 4 driver (Chebyshev inner loop, same outer machinery)
-# =====================================================================
-def algorithm4_progressive(
-    K: int,
-    d: int,
-    objectives: List[Callable],
-    grad_objectives: List[Callable],
-    L: np.ndarray,
-    x0: np.ndarray,
-    reference_map: Dict,
-    mu: Optional[np.ndarray] = None,
-    mode: str = "gap",
-    epsilon: Optional[float] = None,
-    max_outer: int = 50,
-    max_inner: int = 400,
-    prune_inner: bool = True,
-    checkpoint_every: int = 1,
-    eval_every_n_grads: Optional[int] = None,
-    target_err: Optional[float] = None,
-    joint_oracle: Optional[Callable] = None,
-    use_fused_oracle: bool = True,
-    adam_lr: float = 1e-2,
-    adam_b1: float = 0.9,
-    adam_b2: float = 0.999,
-    adam_eps: float = 1e-8,
-    delta: Optional[float] = 1e-2,
-    outer_plateau: bool = True,
-    outer_patience: int = 20,
-    outer_tol: float = 1e-3,
-    outer_rel: bool = True,
-    verbose: bool = False,
-) -> Dict:
-    """Algorithm 2's outer loop with Algorithm 4 (Chebyshev+Adam) inner loop.
-
-    Identical outer structure to ``algorithm2_progressive`` — same PC
-    maximisation over lambda, same checkpointing and worst-case-error
-    metric — but the BundleUpdate inner loop is replaced by
-    ``_chebyshev_update_adaptive``: at each outer-chosen lambda_t we run the
-    Chebyshev-center direction rule of Yoon et al. (2026) with an Adam
-    update to solve the fixed-lambda_t parametric problem
-    min_theta sum_k lambda_{t,k} F_k(theta), appending each inner iterate to
-    the bundle so the outer PC-max and the T_map-based worst-case-error
-    metric are computed exactly as before.
-
-    The inner loop uses the paper's exact stopping rule: each fixed-λ_t
-    Adam-Chebyshev solve terminates when the dual-weighted normalized-
-    gradient norm ‖w_t‖₂ ≤ ``delta`` (Yoon et al. Algorithm 1/4's
-    ε-Pareto-stationarity surrogate).  Outer-loop termination uses the
-    worst-case-error plateau rule (``outer_plateau=True``): the algorithm
-    stops once the checkpointed worst-case suboptimality has not improved
-    by more than ``outer_tol`` for ``outer_patience`` consecutive
-    checkpoints (see ``_OuterPlateauTracker``), in addition to the optional
-    ``target_err`` early-stop and the ``max_outer`` cap.
-
-    Thin wrapper that forwards to ``algorithm2_progressive`` with
-    ``inner_loop="chebyshev"``.
-    """
-    return algorithm2_progressive(
-        K=K, d=d, objectives=objectives, grad_objectives=grad_objectives,
-        L=L, x0=x0, reference_map=reference_map, mu=mu, mode=mode,
-        epsilon=epsilon, max_outer=max_outer, max_inner=max_inner,
-        prune_inner=prune_inner, checkpoint_every=checkpoint_every,
-        eval_every_n_grads=eval_every_n_grads, target_err=target_err,
-        joint_oracle=joint_oracle, use_fused_oracle=use_fused_oracle,
-        inner_loop="chebyshev",
-        adam_lr=adam_lr, adam_b1=adam_b1, adam_b2=adam_b2, adam_eps=adam_eps,
-        delta=delta,
-        outer_plateau=outer_plateau,
-        outer_patience=outer_patience,
-        outer_tol=outer_tol,
-        outer_rel=outer_rel,
-        verbose=verbose,
-    )

@@ -27,9 +27,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import time
-from typing import Dict, Optional
 
-from algorithm import algorithm2_progressive, algorithm4_progressive
+from algorithm import algorithm2_progressive
 from objectives import (
     make_logreg_strongly_convex,
     make_mlp_nonconvex,
@@ -73,7 +72,6 @@ def _plot_cpu_vs_accuracy(
     coarse_resolution: int,
     fine_resolution: int,
     pc_label: str = "GAP",
-    a4: Optional[Dict] = None,
 ) -> None:
     """Plot CPU time vs worst-case suboptimality for both methods.
 
@@ -87,7 +85,7 @@ def _plot_cpu_vs_accuracy(
     # This visualises the accuracy floor the baseline achieves at its
     # full budget — a fixed target that both algorithms can be measured
     # against.  Drawn first so the algorithm curves render on top.
-    err_tol = 4e-3
+    err_tol = 3e-3
     ax.axhline(
         y=err_tol,
         color="#059669", linestyle="--", linewidth=1.5,
@@ -104,12 +102,6 @@ def _plot_cpu_vs_accuracy(
         "s-", color="#dc2626", markersize=5, linewidth=1.8,
         label=f"Uniform discretisation (r = {coarse_resolution})",
     )
-    if a4 is not None:
-        ax.semilogy(
-            a4["cpu_times"], a4["worst_errs"],
-            "^-", color="#7c3aed", markersize=5, linewidth=1.8,
-            label=f"Algorithm 4 (Chebyshev+Adam, {pc_label} stop)",
-        )
 
     ax.set_xlabel("CPU time (s)")
     ax.set_ylabel(r"$\sup_{\lambda \in G_{\mathrm{fine}}}\,"
@@ -135,7 +127,6 @@ def _plot_grads_vs_accuracy(
     coarse_resolution: int,
     fine_resolution: int,
     pc_label: str = "GAP",
-    a4: Optional[Dict] = None,
 ) -> None:
     """Plot gradient evaluations vs worst-case suboptimality.
 
@@ -157,7 +148,7 @@ def _plot_grads_vs_accuracy(
 
     # Horizontal reference line at the baseline's final worst-case error
     # — the accuracy floor the baseline achieves at its full budget.
-    err_tol = 4e-3
+    err_tol = 3e-3
     ax.axhline(
         y=err_tol,
         color="#059669", linestyle="--", linewidth=1.5,
@@ -174,12 +165,6 @@ def _plot_grads_vs_accuracy(
         "s-", color="#dc2626", markersize=5, linewidth=1.8,
         label=f"Uniform discretisation (r = {coarse_resolution})",
     )
-    if a4 is not None:
-        ax.plot(
-            a4["grad_evals_history"], a4["worst_errs"],
-            "^-", color="#7c3aed", markersize=5, linewidth=1.8,
-            label=f"Algorithm 4 (Chebyshev+Adam, {pc_label} stop)",
-        )
 
     ax.set_yscale("log")
 
@@ -255,14 +240,13 @@ def _plot_pc_history(
 # =====================================================================
 def experiment_logreg_gap(
     verbose: bool = True,
-    coarse_resolution: int = 14,
+    coarse_resolution: int = 18,
     fine_resolution: int = 20,
     n_passes: int = 10,
     steps_per_point_per_pass: int = 20,
     max_outer: int = 1200,
     max_inner: int = 100,
     eval_every_n_grads: int = 500,
-    delta: float = 1e-2,
     plot_path_cpu: str = "logreg_cpu_vs_accuracy.png",
     plot_path_grads: str = "logreg_grads_vs_accuracy.png",
     plot_path_pc: str = "logreg_pc_history.png",
@@ -293,7 +277,7 @@ def experiment_logreg_gap(
           "vs worst-case err")
     print("=" * 65)
 
-    K, p, n, reg = 4, 10, 20, 4.1
+    K, p, n, reg = 4, 10, 40, 4.1
     d = K * p
     objs, grads, L, mu, joint_oracle = make_logreg_strongly_convex(K=K, p=p, n=n, reg=reg, seed=42,)
     W0 = np.zeros(d)
@@ -353,39 +337,17 @@ def experiment_logreg_gap(
         # new point.  Tier 1 CPU optimisation; numerically identical to
         # the per-class path.
         joint_oracle=joint_oracle,
-        outer_tol=1e-3,
-        outer_patience=20
-    )
-
-    # --- 3b. Run Algorithm 4 (Chebyshev+Adam inner loop) ---
-    if verbose:
-        print(f"\n  Running Algorithm 4 (Chebyshev+Adam inner loop, "
-              f"{max_outer} outer iters) ...")
-    a4 = algorithm4_progressive(
-        K=K, d=d, objectives=objs, grad_objectives=grads,
-        L=L, x0=W0, reference_map=reference_map,
-        mu=mu, mode="gap",
-        max_outer=max_outer, max_inner=max_inner,
-        checkpoint_every=20,
-        eval_every_n_grads=eval_every_n_grads,
-        verbose=verbose, epsilon=1e-5,
-        target_err=bl["worst_errs"][-1],
-        joint_oracle=joint_oracle,
-        adam_lr=1e-2,
-        delta=delta,
-        outer_tol=1e-3,
-        outer_patience=20
     )
 
     # --- 4. Plots ---
     _plot_cpu_vs_accuracy(
-        bl=bl, a2=a2, a4=None, plot_path=plot_path_cpu,
+        bl=bl, a2=a2, plot_path=plot_path_cpu,
         problem_params={"K": K, "p": p, "n": n, "d": d, "reg": reg},
         coarse_resolution=coarse_resolution,
         fine_resolution=fine_resolution,
     )
     _plot_grads_vs_accuracy(
-        bl=bl, a2=a2, a4=None, plot_path=plot_path_grads,
+        bl=bl, a2=a2, plot_path=plot_path_grads,
         problem_params={"K": K, "p": p, "n": n, "d": d, "reg": reg},
         coarse_resolution=coarse_resolution,
         fine_resolution=fine_resolution,
@@ -401,7 +363,6 @@ def experiment_logreg_gap(
         "reference_map": reference_map,
         "baseline": bl,
         "algorithm2": a2,
-        "algorithm4": a4,
         "problem_params": {"K": K, "p": p, "n": n, "d": d, "reg": reg},
     }
 
@@ -412,19 +373,18 @@ def experiment_logreg_gap(
 # =====================================================================
 def experiment_mlp_gn(
     verbose: bool = True,
-    K: int = 3,
-    p: int = 5,
-    n: int = 10,
-    h: int = 5,
-    coarse_resolution: int = 15,
-    fine_resolution: int = 16,
+    K: int = 6,
+    p: int = 10,
+    n: int = 50,
+    h: int = 16,
+    coarse_resolution: int = 6,
+    fine_resolution: int = 7,
     n_passes: int = 20,
     steps_per_point_per_pass: int = 100,
     max_outer: int = 1200,
     max_inner: int = 400,
     eval_every_n_grads: int = 500,
     epsilon: float = 1e-5,
-    delta: float = 1e-2,
     plot_path_cpu: str = "MLP_cpu_vs_accuracy.png",
     plot_path_grads: str = "MLP_grads_vs_accuracy.png",
     plot_path_pc: str = "MLP_pc_history.png",
@@ -557,41 +517,19 @@ def experiment_mlp_gn(
         # two (F_i + ∇F_i) on every bundle.add_point.  Tier 1 CPU
         # optimisation; numerically identical to per-class path.
         joint_oracle=joint_oracle,
-        outer_tol=1e-3,
-        outer_patience=5000
-    )
-
-    # --- 3b. Run Algorithm 4 (Chebyshev+Adam inner loop, GN stop) ---
-    if verbose:
-        print(f"\n  Running Algorithm 4 (Chebyshev+Adam inner loop, "
-              f"{max_outer} outer iters) ...")
-    a4 = algorithm4_progressive(
-        K=K, d=d, objectives=objs, grad_objectives=grads,
-        L=L, x0=theta0, reference_map=reference_map,
-        mu=None, mode="gn",
-        max_outer=max_outer, max_inner=max_inner,
-        checkpoint_every=20,
-        eval_every_n_grads=eval_every_n_grads,
-        verbose=verbose, epsilon=epsilon,
-        target_err=bl["worst_errs"][-1],
-        joint_oracle=joint_oracle,
-        adam_lr=1e-2,
-        delta=delta,
-        outer_tol=1e-3,
-        outer_patience=50
     )
 
     # --- 4. Plots ---
     problem_params = {"K": K, "p": p, "n": n, "h": h, "d": d}
     _plot_cpu_vs_accuracy(
-        bl=bl, a2=a2, a4=a4, plot_path=plot_path_cpu,
+        bl=bl, a2=a2, plot_path=plot_path_cpu,
         problem_params=problem_params,
         coarse_resolution=coarse_resolution,
         fine_resolution=fine_resolution,
         pc_label = 'GN'
     )
     _plot_grads_vs_accuracy(
-        bl=bl, a2=a2, a4=a4, plot_path=plot_path_grads,
+        bl=bl, a2=a2, plot_path=plot_path_grads,
         problem_params=problem_params,
         coarse_resolution=coarse_resolution,
         fine_resolution=fine_resolution,
@@ -607,7 +545,6 @@ def experiment_mlp_gn(
         "reference_map": reference_map,
         "baseline": bl,
         "algorithm2": a2,
-        "algorithm4": a4,
         "problem_params": problem_params,
     }
 
@@ -637,7 +574,7 @@ def _format_params(params):
 
 # =====================================================================
 if __name__ == "__main__":
-    #res1 = experiment_logreg_gap()
-    #print("✓ Experiment 1 completed.")
-    res2 = experiment_mlp_gn()
-    print("✓ Experiment 2 completed.")
+    res1 = experiment_logreg_gap()
+    print("✓ Experiment 1 completed.")
+    #res2 = experiment_mlp_gn()
+    #print("✓ Experiment 2 completed.")
