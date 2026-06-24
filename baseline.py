@@ -4,31 +4,15 @@ baseline.py  –  Uniform-discretisation baseline for smooth MOO
 
 Evaluation protocol
 -------------------
-We compare Algorithm 2 against the uniform-discretisation baseline on
-a **CPU-time-vs-worst-case-accuracy** axis.
-
-- A very fine uniform grid G_fine on Δ_K is treated as our benchmark
-  for evaluating worst-case metric accuracy.  The reference optimal
-  values F*_λ at each fine-grid point are computed offline once (by
-  running gradient descent to very high accuracy) and stored.
-
-- The baseline uses a coarser resolution r (r << resolution of G_fine)
-  and runs warm-started gradient descent across the coarse grid
-  repeatedly.  The inner loop does NOT stop based on any per-point
-  tolerance — instead, after every M total gradient-descent iterations
+- The baseline uses a coarser resolution r and runs warm-started gradient descent across the coarse grid
+  repeatedly.  The inner loop does NOT stop based on any per-point tolerance —
+  instead, after every M total gradient-descent iterations
   (a "checkpoint"), we pause, evaluate the current worst-case error of
   the rounded solution map, record (CPU time, err), and resume.
 
-- Algorithm 2 is similarly checkpointed: after every outer iteration
-  we evaluate the worst-case error of  T(·; B_t)  on G_fine and record
-  (CPU time, err).
 
 - The final comparison plot is CPU time (x-axis) vs worst-case
   function-value suboptimality (y-axis).
-  Under PL-condition, the worst-case suboptimality  sup_{λ ∈ G_fine} [F_λ(x̂(λ)) − F*_λ]
-  is the right "apples-to-apples" metric across methods.
-  Under generic non-convexity, worst-case suboptimality  sup_{λ ∈ G_fine} ||∇F_λ(x̂(λ))||^2
-  is the right "apples-to-apples" metric across methods.
 """
 
 from __future__ import annotations
@@ -118,89 +102,6 @@ def _nag_inner_loop_sc(
     return x, y, iters_used
 
 
-def compute_reference_map(
-    K: int,
-    d: int,
-    objectives: List[Callable],
-    grad_objectives: List[Callable],
-    L: np.ndarray,
-    x0: np.ndarray,
-    fine_resolution: int = 80,
-    n_iters: int = 20_000,
-    grad_tol: float = 1e-10,
-    mu: Optional[np.ndarray] = None,
-    verbose: bool = False,
-) -> Dict:
-    """Precompute the reference optimal-value map on a fine grid.
-
-    For each λ in G_fine, run an inner solver on F_λ(·) to very high
-    accuracy (either ``n_iters`` iterations or until the gradient norm
-    falls below ``grad_tol``).  Warm-starting from the previous fine-grid
-    point's solution dramatically accelerates convergence for
-    strongly-convex problems.
-
-    Solver
-    ------
-    * **`mu` is given** (strongly-convex problems, e.g. regularised
-      logistic regression):  Nesterov's accelerated gradient with the
-      strongly-convex constant-momentum coefficient
-          β = (√L_λ − √µ_λ) / (√L_λ + √µ_λ).
-      This achieves a √κ_λ-iteration speedup over vanilla GD —
-      ~10× fewer iterations for a typical κ_λ = 100.
-
-    * **`mu` is None** (the generic / non-convex case): vanilla
-      gradient descent, the original reference solver.  NAG without a
-      provable strong-convexity constant can amplify the
-      over-stepping that already plagues GD when the estimated
-      Lipschitz constant under-approximates the local curvature
-      (e.g. the ReLU MLP), so we stay with the conservative choice.
-
-    Returns
-    -------
-    dict with keys "fine_grid", "F_star", "x_star".
-    """
-    grid = _uniform_simplex_grid(K, fine_resolution)
-    grid = _sort_grid_for_warmstart(grid)
-    N_fine = grid.shape[0]
-
-    F_star = np.zeros(N_fine)
-    x_star = np.zeros((N_fine, d))
-    x_prev = x0.copy()
-
-    for g_idx, lam in enumerate(grid):
-        Ll = float(lam @ L)
-        # Build a closure that returns the scalarised gradient at any z.
-        # Hoist lam out of the closure as a default arg to avoid a
-        # Python-level free-variable capture cost in the hot inner loop.
-        lam_local = lam
-        def grad_fn(z, lam_=lam_local):
-            return sum(lam_[k] * grad_objectives[k](z) for k in range(K))
-
-        if mu is not None:
-            mul = float(lam @ mu)
-            # Cold-start NAG at this fine-grid point: y = x.
-            x_init = x_prev.copy()
-            x_solved, _, _ = _nag_inner_loop_sc(
-                x=x_init, y=x_init.copy(), n_iters=n_iters,
-                grad_fn=grad_fn, L_lam=Ll, mu_lam=mul, grad_tol=grad_tol)
-        else:
-            x_solved = x_prev.copy()
-            for _ in range(n_iters):
-                g_lam = grad_fn(x_solved)
-                if np.linalg.norm(g_lam) < grad_tol:
-                    break
-                x_solved = x_solved - (1.0 / Ll) * g_lam
-
-        F_star[g_idx] = sum(lam[k] * objectives[k](x_solved) for k in range(K))
-        x_star[g_idx] = x_solved
-        x_prev = x_solved
-
-        if verbose and (g_idx % max(1, N_fine // 10) == 0 or g_idx == N_fine - 1):
-            print(f"    reference: {g_idx + 1:4d}/{N_fine}  |  F*_λ = {F_star[g_idx]:.6e}")
-
-    return {"fine_grid": grid, "F_star": F_star, "x_star": x_star}
-
-
 # =====================================================================
 #  Grid utilities
 # =====================================================================
@@ -243,71 +144,23 @@ def _nearest_coarse_index(lam: np.ndarray, coarse_grid: np.ndarray) -> int:
     return int(np.argmin(dists))
 
 
-def worst_case_suboptimality_baseline(
-    coarse_grid: np.ndarray,
-    coarse_solutions: np.ndarray,
-    reference_map: Dict,
-    objectives: List[Callable],
-    K: int,
-    grad_objectives: Optional[List[Callable]] = None,
-    metric: str = "gap",
-) -> float:
-    """Worst-case quality of the rounded baseline map over the fine grid.
-
-    The baseline map is  x̂_baseline(λ) = coarse_solutions[argmin_g ‖λ − λ^(g)‖_1].
-    Two worst-case measures, selected by ``metric`` (must match the measure
-    used for the A2/A4 curve so the comparison is apples-to-apples):
-
-    * ``metric="gap"`` (default):
-          err = sup_{λ ∈ G_fine} [ F_λ(x̂_baseline(λ)) − F*_λ ].
-    * ``metric="gradnorm"`` (for non-convex problems, e.g. the MLP):
-          err = sup_{λ ∈ G_fine} ‖∇F_λ(x̂_baseline(λ))‖²,
-      which does not reference ``F*``.  Requires ``grad_objectives``.
-    """
-    fine_grid = reference_map["fine_grid"]
-    worst = -np.inf
-    if metric == "gradnorm":
-        if grad_objectives is None:
-            raise ValueError("metric='gradnorm' requires grad_objectives")
-        for i, lam in enumerate(fine_grid):
-            g_star = _nearest_coarse_index(lam, coarse_grid)
-            x_hat = coarse_solutions[g_star]
-            g = np.zeros_like(x_hat, dtype=np.float64)
-            for k in range(K):
-                g = g + lam[k] * grad_objectives[k](x_hat)
-            gn = float(np.dot(g, g))
-            if gn > worst:
-                worst = gn
-        return worst
-
-    F_star = reference_map["F_star"]
-    for i, lam in enumerate(fine_grid):
-        g_star = _nearest_coarse_index(lam, coarse_grid)
-        x_hat = coarse_solutions[g_star]
-        F_lam = sum(lam[k] * objectives[k](x_hat) for k in range(K))
-        err = F_lam - F_star[i]
-        if err > worst:
-            worst = err
-    return float(worst)
-
-
 # =====================================================================
 #  Progressive baseline:  GD along the coarse grid with checkpoints
 # =====================================================================
-def uniform_discretisation_progressive(
+def uniform_discretisation(
     K: int,
-    d: int,
     objectives: List[Callable],
     grad_objectives: List[Callable],
     L: np.ndarray,
     x0: np.ndarray,
     resolution: int,
-    reference_map: Dict,
     n_passes: int = 1,
     steps_per_point_per_pass: int = 20,
     eval_every_n_grads: Optional[int] = None,
     mu: Optional[np.ndarray] = None,
     metric: str = "gap",
+    coverage_mode: Optional[str] = None,
+    joint_oracle: Optional[Callable] = None,
     verbose: bool = False,
 ) -> Dict:
     """Run the baseline in "progressive" mode, with periodic checkpoints.
@@ -357,7 +210,6 @@ def uniform_discretisation_progressive(
     Parameters
     ----------
     resolution                : coarse grid resolution  r.
-    reference_map             : output of ``compute_reference_map(..)``.
     n_passes                  : total number of passes to run.
     steps_per_point_per_pass  : solver steps taken at each grid point per pass.
     eval_every_n_grads        : if set, checkpoint at the next pass boundary after every M gradient evals.
@@ -394,34 +246,46 @@ def uniform_discretisation_progressive(
 
     cpu_times: List[float] = []
     worst_errs: List[float] = []
+    cov_history: List[float] = []
     total_iters_history: List[int] = []
     grad_evals_history: List[int] = []
     total_iters = 0
     grad_evals_at_last_ckpt = 0
     t_start = time.time()
 
-    # Accumulator for time spent inside worst_case_suboptimality_baseline
+    # Accumulator for time spent computing the maximum of PC over the unit simplex
     # across all prior checkpoints — subtracted from the next checkpoint's
     # recorded wall time so that previous checkpoints' evaluation costs
     # don't leak into the iterative-work measurement.  See the matching
-    # comment in algorithm.py:algorithm2_progressive.
+    # comment in algorithm.py:algorithm_adaptive.
     checkpoint_overhead = 0.0
-
     def _checkpoint(label: str) -> None:
         nonlocal checkpoint_overhead
         cpu_times.append(time.time() - t_start - checkpoint_overhead)
         ck_t0 = time.time()
-        err = worst_case_suboptimality_baseline(
-            coarse_grid, solutions, reference_map, objectives, K,
-            grad_objectives=grad_objectives, metric=metric)
+        err = float("nan")
+        # Reference-map-free bundle-coverage metric (the note's GAP*/GN*):
+        # the uniform method's "bundle" is the set of current last-iterate
+        # points (one per grid node).  Build it and score it with the same
+        # pc_star maximiser the adaptive method uses.  Assembling the bundle
+        # and the max-over-simplex solve are measurement overhead, excluded
+        # from the recorded cpu / grad-eval axes.
+        if coverage_mode is not None:
+            from algorithm import bundle_from_points, pc_star
+            cov_bundle = bundle_from_points(
+                solutions, K, solutions.shape[1], L, mu,
+                objectives, grad_objectives, joint_oracle=joint_oracle)
+            cov, _ = pc_star(cov_bundle, coverage_mode)
+            cov_history.append(cov)
         checkpoint_overhead += time.time() - ck_t0
         worst_errs.append(err)
         total_iters_history.append(total_iters)
         grad_evals_history.append(total_iters * K)
         if verbose:
+            cov_str = f" | worst-case pc={cov_history[-1]:.4e}" if coverage_mode is not None else ""
             print(f"  Baseline {label} | t={cpu_times[-1]:.2f}s "
-                  f"| iters={total_iters} | grad_evals={total_iters * K} "
-                  f"| err={err:.3e}")
+                  f"| iters={total_iters} | grad_evals={total_iters * K}"
+                  f"{cov_str}")
 
     # Checkpoint 0:  all solutions = x0.
     _checkpoint(f"pass 0/{n_passes}")
@@ -498,5 +362,6 @@ def uniform_discretisation_progressive(
         "worst_errs": worst_errs,
         "total_iters_history": total_iters_history,
         "grad_evals_history": grad_evals_history,
+        "cov_history": cov_history,
         "resolution": resolution,
     }

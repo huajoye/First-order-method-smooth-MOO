@@ -1,5 +1,5 @@
 """
-bundle.py  –  Core bundle data structure and progress criteria (Example 2)
+bundle.py  –  Core bundle data structure
 ==========================================================================
 
 This module implements the *bundle* B_m from Section 3 of the paper:
