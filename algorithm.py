@@ -4,6 +4,7 @@ algorithm.py  –  Adaptive Algorithm (Algorithm 6)
 
 from __future__ import annotations
 import numpy as np
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 from scipy.optimize import minimize as sp_minimize
 
@@ -12,8 +13,12 @@ from scipy.optimize import minimize as sp_minimize
 # module still loads if it is absent, in which case `_maximise_GN` falls
 # back to SLSQP with a one-time warning.
 
-from cyipopt import minimize_ipopt as _ipopt_minimize
-_HAS_IPOPT = True
+try:
+    from cyipopt import minimize_ipopt as _ipopt_minimize
+    _HAS_IPOPT = True
+except ModuleNotFoundError:
+    _ipopt_minimize = None
+    _HAS_IPOPT = False
 import warnings
 
 from bundle import Bundle, UB, GAP, GN, LB, T_map
@@ -504,6 +509,133 @@ def _bundle_update_adaptive(
 # =====================================================================
 #  Instrumented Adaptive Algorithm:  checkpoint after each outer iteration
 # =====================================================================
+def algorithm_adaptive(
+    K: int,
+    d: int,
+    objectives: List[Callable],
+    grad_objectives: List[Callable],
+    L: np.ndarray,
+    x0: np.ndarray,
+    *,
+    mu: Optional[np.ndarray] = None,
+    mode: str = "gn",
+    max_outer: int = 120,
+    max_inner: int = 25,
+    epsilon: Optional[float] = None,
+    eval_every_n_grads: Optional[int] = None,
+    target_cov: Optional[float] = None,
+    prune_inner: bool = True,
+    joint_oracle: Optional[Callable] = None,
+    verbose: bool = False,
+) -> Dict:
+    """Run the adaptive bundle method with reference-map-free checkpoints.
+
+    The current coverage experiment uses the non-convex MLP setting, so the
+    supported progress criterion is ``mode="gn"``:
+
+        GN*(B) = max_lambda min_i ||grad F_lambda(x_i)||^2.
+
+    CPU time spent on checkpoint metric evaluation is excluded from the
+    reported CPU axis, matching the baseline accounting.
+    """
+    if mode != "gn":
+        raise ValueError("algorithm_adaptive currently supports mode='gn' for the MLP coverage experiment.")
+
+    L_arr = np.asarray(L, dtype=float)
+    mu_arr = None if mu is None else np.asarray(mu, dtype=float)
+    bundle = Bundle(K=K, d=d, L=L_arr, mu=mu_arr)
+
+    # Checkpoint 0 starts from the initial bundle but does not count its
+    # oracle evaluation as iterative work, matching the baseline's setup.
+    bundle.add_point(np.asarray(x0, dtype=float), objectives, grad_objectives, joint_oracle=joint_oracle)
+
+    cpu_times: List[float] = []
+    cov_history: List[float] = []
+    pc_history: List[float] = []
+    total_iters_history: List[int] = []
+    grad_evals_history: List[int] = []
+    inner_steps_history: List[int] = []
+    lambda_history: List[np.ndarray] = []
+
+    total_iters = 0
+    grad_evals_at_last_ckpt = 0
+    prev_lam: Optional[np.ndarray] = None
+    checkpoint_overhead = 0.0
+    t_start = time.time()
+
+    def _checkpoint(label: str) -> None:
+        nonlocal checkpoint_overhead, prev_lam
+        cpu_times.append(time.time() - t_start - checkpoint_overhead)
+        ck_t0 = time.time()
+        cov, cov_lam = _pc_star_metric(bundle, mode, prev_lam=prev_lam)
+        prev_lam = cov_lam
+        cov_history.append(cov)
+        checkpoint_overhead += time.time() - ck_t0
+        total_iters_history.append(total_iters)
+        grad_evals_history.append(total_iters * K)
+        if verbose:
+            print(
+                f"  Adaptive {label} | t={cpu_times[-1]:.2f}s "
+                f"| bundle={bundle.m} | iters={total_iters} "
+                f"| grad_evals={total_iters * K} | worst-case pc={cov:.4e}"
+            )
+
+    _checkpoint(f"outer 0/{max_outer}")
+    cpu_times[0] = 0.0
+    t_start = time.time()
+    checkpoint_overhead = 0.0
+
+    pc_fn = GN
+    eps_inner = None if epsilon is None else epsilon / 3.0
+
+    for outer in range(1, max_outer + 1):
+        pc_val, lam = _maximise_GN(bundle, prev_lam=prev_lam)
+        prev_lam = lam
+        pc_history.append(pc_val)
+        lambda_history.append(lam.copy())
+
+        if epsilon is not None and pc_val <= epsilon:
+            _checkpoint(f"outer {outer}/{max_outer}")
+            break
+
+        steps = _bundle_update_adaptive(
+            bundle=bundle,
+            lam=lam,
+            pc_fn=pc_fn,
+            objectives=objectives,
+            grad_objectives=grad_objectives,
+            max_steps=max_inner,
+            eps_inner=eps_inner,
+            prune=prune_inner,
+            joint_oracle=joint_oracle,
+        )
+        inner_steps_history.append(steps)
+        total_iters += steps
+
+        cur_grad_evals = total_iters * K
+        do_ckpt = (
+            eval_every_n_grads is None
+            or (cur_grad_evals - grad_evals_at_last_ckpt) >= eval_every_n_grads
+            or outer == max_outer
+        )
+        if do_ckpt:
+            _checkpoint(f"outer {outer}/{max_outer}")
+            grad_evals_at_last_ckpt = cur_grad_evals
+            if target_cov is not None and cov_history[-1] <= target_cov:
+                break
+
+    return {
+        "bundle": bundle,
+        "cpu_times": cpu_times,
+        "cov_history": cov_history,
+        "pc_history": pc_history,
+        "total_iters_history": total_iters_history,
+        "grad_evals_history": grad_evals_history,
+        "inner_steps_history": inner_steps_history,
+        "lambda_history": lambda_history,
+        "max_outer": max_outer,
+        "max_inner": max_inner,
+    }
 
 
 
